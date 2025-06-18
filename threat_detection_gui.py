@@ -5,18 +5,22 @@ from PIL import Image, ImageTk
 import threading
 from threat_detection import load_yolo, detect_threat, setup_arduino
 import time
+import queue
 
 class ThreatDetectionGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("AI Threat Detection System")
-        self.root.geometry("1200x800")
+        self.root.geometry("1400x900")
         
         # Initialize variables
         self.is_running = False
         self.cap = None
         self.model = None
         self.arduino = None
+        self.frame_queue = queue.Queue(maxsize=3)  # Increased queue size
+        self.status_queue = queue.Queue()
+        self.current_image = None  # Keep reference to prevent garbage collection
         
         # Create main frame
         self.main_frame = ttk.Frame(self.root, padding="10")
@@ -37,34 +41,77 @@ class ThreatDetectionGUI:
         self.start_button = ttk.Button(self.control_frame, text="Start Detection", command=self.toggle_detection)
         self.start_button.grid(row=0, column=0, padx=5, pady=5)
         
+        # Arduino status
+        self.arduino_status = ttk.Label(self.control_frame, text="Arduino: Disconnected", font=("Arial", 10))
+        self.arduino_status.grid(row=1, column=0, padx=5, pady=5)
+        
+        # Detection settings
+        self.settings_frame = ttk.LabelFrame(self.control_frame, text="Settings", padding="5")
+        self.settings_frame.grid(row=2, column=0, padx=5, pady=5, sticky="ew")
+        
+        # Confidence threshold slider
+        ttk.Label(self.settings_frame, text="Detection Confidence:").grid(row=0, column=0, padx=5, pady=2)
+        self.confidence_var = tk.DoubleVar(value=0.5)
+        self.confidence_slider = ttk.Scale(self.settings_frame, from_=0.1, to=0.9, 
+                                         variable=self.confidence_var, orient="horizontal")
+        self.confidence_slider.grid(row=1, column=0, padx=5, pady=2, sticky="ew")
+        
         # Status indicators
-        self.status_frame = ttk.LabelFrame(self.main_frame, text="Status", padding="5")
+        self.status_frame = ttk.LabelFrame(self.main_frame, text="System Status", padding="5")
         self.status_frame.grid(row=1, column=1, padx=5, pady=5, sticky="nsew")
         
-        self.threat_status = ttk.Label(self.status_frame, text="Threat Status: Normal", font=("Arial", 12))
-        self.threat_status.grid(row=0, column=0, padx=5, pady=5)
+        self.threat_status = ttk.Label(self.status_frame, text="Threat Status: Normal", 
+                                     font=("Arial", 12, "bold"))
+        self.threat_status.grid(row=0, column=0, padx=5, pady=5, sticky="w")
         
-        self.fps_label = ttk.Label(self.status_frame, text="FPS: 0", font=("Arial", 12))
-        self.fps_label.grid(row=1, column=0, padx=5, pady=5)
+        self.detection_info = ttk.Label(self.status_frame, text="Detection Info: None", 
+                                      font=("Arial", 10))
+        self.detection_info.grid(row=1, column=0, padx=5, pady=2, sticky="w")
+        
+        self.fps_label = ttk.Label(self.status_frame, text="FPS: 0", font=("Arial", 10))
+        self.fps_label.grid(row=2, column=0, padx=5, pady=2, sticky="w")
+        
+        self.frame_count_label = ttk.Label(self.status_frame, text="Frames Processed: 0", 
+                                         font=("Arial", 10))
+        self.frame_count_label.grid(row=3, column=0, padx=5, pady=2, sticky="w")
         
         # Configure grid weights
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
-        self.main_frame.columnconfigure(0, weight=1)
+        self.main_frame.columnconfigure(0, weight=2)
         self.main_frame.columnconfigure(1, weight=1)
         self.main_frame.rowconfigure(0, weight=3)
         self.main_frame.rowconfigure(1, weight=1)
+        self.settings_frame.columnconfigure(0, weight=1)
         
         # Initialize system
         self.initialize_system()
+        
+        # Start status update thread
+        self.update_status()
     
     def initialize_system(self):
         """Initialize the YOLO model and Arduino connection"""
         try:
+            # Show loading message
+            self.threat_status.config(text="Initializing System...", foreground="blue")
+            self.root.update()
+            
+            # Load YOLO model
             self.model = load_yolo()
+            
+            # Setup Arduino
             self.arduino = setup_arduino()
+            if self.arduino:
+                self.arduino_status.config(text="Arduino: Connected", foreground="green")
+            else:
+                self.arduino_status.config(text="Arduino: Disconnected", foreground="red")
+            
+            self.threat_status.config(text="Threat Status: Ready", foreground="green")
             messagebox.showinfo("Success", "System initialized successfully!")
+            
         except Exception as e:
+            self.threat_status.config(text="Threat Status: Initialization Failed", foreground="red")
             messagebox.showerror("Error", f"Failed to initialize system: {str(e)}")
     
     def toggle_detection(self):
@@ -76,10 +123,22 @@ class ThreatDetectionGUI:
     
     def start_detection(self):
         """Start the threat detection system"""
+        if not self.model:
+            messagebox.showerror("Error", "YOLO model not loaded!")
+            return
+            
         self.is_running = True
         self.start_button.config(text="Stop Detection")
         self.cap = cv2.VideoCapture(0)
-        threading.Thread(target=self.update_frame, daemon=True).start()
+        
+        if not self.cap.isOpened():
+            messagebox.showerror("Error", "Could not open webcam!")
+            self.stop_detection()
+            return
+        
+        # Start processing threads
+        threading.Thread(target=self.capture_frames, daemon=True).start()
+        threading.Thread(target=self.process_frames, daemon=True).start()
     
     def stop_detection(self):
         """Stop the threat detection system"""
@@ -87,14 +146,19 @@ class ThreatDetectionGUI:
         self.start_button.config(text="Start Detection")
         if self.cap:
             self.cap.release()
+            self.cap = None
+        
+        # Clear queues
+        while not self.frame_queue.empty():
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                break
     
-    def update_frame(self):
-        """Update the video frame with detection results"""
+    def capture_frames(self):
+        """Capture frames from camera in separate thread"""
         frame_count = 0
-        start_time = cv2.getTickCount()
-        skip_frames = 30  # Process every 30th frame
-        last_detection_time = 0
-        detection_interval = 1.0  # Run detection every 1 second
+        start_time = time.time()
         
         while self.is_running:
             if self.cap is None:
@@ -106,46 +170,101 @@ class ThreatDetectionGUI:
             
             frame_count += 1
             
-            # Skip frames to improve performance
-            if frame_count % skip_frames != 0:
+            # Put frame in queue (non-blocking)
+            try:
+                self.frame_queue.put_nowait((frame, frame_count, time.time() - start_time))
+            except queue.Full:
+                # Remove old frame and add new one
+                try:
+                    self.frame_queue.get_nowait()
+                    self.frame_queue.put_nowait((frame, frame_count, time.time() - start_time))
+                except queue.Empty:
+                    pass
+            
+            # Small delay to prevent overwhelming the queue
+            time.sleep(0.05)  # Reduced to ~20 FPS for smoother display
+    
+    def process_frames(self):
+        """Process frames with threat detection in separate thread"""
+        last_detection_time = 0
+        detection_interval = 1.0  # Run detection every 1 second for stability
+        last_display_time = 0
+        display_interval = 0.1  # Update display every 100ms
+        
+        while self.is_running:
+            try:
+                frame, frame_count, elapsed_time = self.frame_queue.get(timeout=0.1)
+            except queue.Empty:
                 continue
             
-            # Resize frame for faster processing
-            frame = cv2.resize(frame, (320, 240))  # Reduced resolution
-            
             current_time = time.time()
-            # Only run detection periodically
+            
+            # Run detection periodically
             if current_time - last_detection_time >= detection_interval:
+                # Resize frame for processing
+                processed_frame = cv2.resize(frame, (640, 480))
+                
                 # Process frame with threat detection
-                processed_frame, threat_detected = detect_threat(frame, self.model)
+                processed_frame, threat_detected = detect_threat(processed_frame, self.model)
                 last_detection_time = current_time
                 
-                # Update threat status
-                if threat_detected:
-                    self.threat_status.config(text="Threat Status: THREAT DETECTED!", foreground="red")
-                else:
-                    self.threat_status.config(text="Threat Status: Normal", foreground="green")
+                # Send status update
+                try:
+                    self.status_queue.put_nowait({
+                        'threat_detected': threat_detected,
+                        'frame_count': frame_count,
+                        'fps': frame_count / elapsed_time if elapsed_time > 0 else 0
+                    })
+                except queue.Full:
+                    pass
+                
+                # Send signal to Arduino if threat detected
+                if self.arduino and threat_detected:
+                    try:
+                        self.arduino.write("1".encode())
+                    except:
+                        pass
             else:
-                # Just resize and display frame without detection
+                # Just resize frame for display
                 processed_frame = cv2.resize(frame, (640, 480))
             
-            # Calculate and update FPS
-            if frame_count % 30 == 0:
-                end_time = cv2.getTickCount()
-                fps = 30 / ((end_time - start_time) / cv2.getTickFrequency())
-                self.fps_label.config(text=f"FPS: {fps:.1f}")
-                start_time = cv2.getTickCount()
-            
-            # Convert frame to PhotoImage
-            processed_frame = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(processed_frame)
-            img = ImageTk.PhotoImage(image=img)
-            
-            # Update video label
-            self.video_label.config(image=img)
-            
-            # Small delay to prevent high CPU usage
-            cv2.waitKey(1)
+            # Update display periodically to prevent flashing
+            if current_time - last_display_time >= display_interval:
+                # Convert frame to PhotoImage
+                processed_frame = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(processed_frame)
+                img = ImageTk.PhotoImage(image=img)
+                
+                # Keep reference to prevent garbage collection
+                self.current_image = img
+                
+                # Update video label in main thread
+                self.root.after(0, lambda img=img: self.video_label.config(image=img))
+                last_display_time = current_time
+    
+    def update_status(self):
+        """Update status display in main thread"""
+        try:
+            while not self.status_queue.empty():
+                status = self.status_queue.get_nowait()
+                
+                # Update threat status
+                if status['threat_detected']:
+                    self.threat_status.config(text="Threat Status: HIGH THREAT!", foreground="red")
+                    self.detection_info.config(text="Detection: Person with Weapon Detected", foreground="red")
+                else:
+                    self.threat_status.config(text="Threat Status: Normal", foreground="green")
+                    self.detection_info.config(text="Detection: No Threats", foreground="green")
+                
+                # Update FPS and frame count
+                self.fps_label.config(text=f"FPS: {status['fps']:.1f}")
+                self.frame_count_label.config(text=f"Frames Processed: {status['frame_count']}")
+                
+        except queue.Empty:
+            pass
+        
+        # Schedule next update
+        self.root.after(200, self.update_status)  # Reduced update frequency
     
     def __del__(self):
         """Cleanup when the application is closed"""
@@ -159,4 +278,4 @@ def main():
     root.mainloop()
 
 if __name__ == "__main__":
-    main() 
+    main()
