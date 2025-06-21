@@ -6,4 +6,8 @@ ultralytics>=8.0.0  # For YOLOv8
 
 # Additional dependencies for better performance
 torch>=2.0.0  # Required for YOLOv8
-torchvision>=0.15.0 
+torchvision>=0.15.0
+
+# Email functionality
+# Note: smtplib and email modules are part of Python standard library
+# No additional packages needed for basic email functionality 
