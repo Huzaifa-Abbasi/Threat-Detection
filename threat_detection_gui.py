@@ -8,7 +8,7 @@ from tkinter import ttk, messagebox
 import cv2
 from PIL import Image, ImageTk
 import threading
-from threat_detection import load_yolo, detect_threat, setup_arduino, EMAIL_CONFIG, send_threat_email
+from threat_detection import load_yolo, detect_threat, setup_arduino, EMAIL_CONFIG, send_threat_email, is_email_config_valid
 import time
 import queue
 import os
@@ -29,6 +29,13 @@ class SimpleGUI:
         self.email_expanded = False
         self.last_email_time = 0  # Email cooldown
         self.email_cooldown = 60  # 60 seconds between emails
+        self.source_var = tk.StringVar(value="webcam")
+        self.detection_buffer = [False] * 10  # Increased buffer size for more smoothing
+        self.hold_counter = 0  # Hold period counter
+        self.hold_period = 10  # Number of frames to hold alert after last detection
+        self.last_smoothed_threat = False
+        self.last_threat_status = None
+        self.first_email_sent = False  # Track if first email was sent for popup
         
         # Create layout
         self.create_layout()
@@ -109,16 +116,34 @@ class SimpleGUI:
                                      foreground="red")
         self.email_status.pack(pady=5)
         
-        # Status section
-        status_frame = ttk.LabelFrame(control_frame, text="Status")
-        status_frame.pack(fill=tk.X, pady=10)
+        # Camera source selection
+        source_frame = ttk.LabelFrame(control_frame, text="Camera Source")
+        source_frame.pack(fill=tk.X, pady=5)
         
-        self.threat_status = ttk.Label(status_frame, text="Threat: Normal", 
-                                     font=("Arial", 12, "bold"))
-        self.threat_status.pack(pady=5)
+        self.webcam_radio = ttk.Radiobutton(source_frame, text="Webcam", variable=self.source_var, value="webcam", command=self.toggle_source_entry)
+        self.webcam_radio.pack(anchor=tk.W, padx=10, pady=2)
+        self.ipcam_radio = ttk.Radiobutton(source_frame, text="IP Camera (DroidCam)", variable=self.source_var, value="ipcam", command=self.toggle_source_entry)
+        self.ipcam_radio.pack(anchor=tk.W, padx=10, pady=2)
         
-        self.fps_label = ttk.Label(status_frame, text="FPS: 0")
-        self.fps_label.pack(pady=2)
+        # IP Camera URL frame
+        ipcam_frame = ttk.Frame(source_frame)
+        ipcam_frame.pack(fill=tk.X, padx=10, pady=2)
+        
+        ttk.Label(ipcam_frame, text="DroidCam URL:").pack(anchor=tk.W)
+        self.ipcam_url_var = tk.StringVar(value="http://192.168.1.100:4747/video")
+        self.ipcam_url_entry = ttk.Entry(ipcam_frame, textvariable=self.ipcam_url_var, width=30)
+        self.ipcam_url_entry.pack(anchor=tk.W, pady=2)
+        self.ipcam_url_entry.configure(state="disabled")
+        
+        # Test connection button
+        self.test_ipcam_btn = ttk.Button(ipcam_frame, text="Test DroidCam Connection", 
+                                        command=self.test_droidcam_connection, width=25)
+        self.test_ipcam_btn.pack(anchor=tk.W, pady=2)
+        self.test_ipcam_btn.configure(state="disabled")
+        
+        # IP Camera status
+        self.ipcam_status = ttk.Label(ipcam_frame, text="DroidCam: Not tested", foreground="gray")
+        self.ipcam_status.pack(anchor=tk.W, pady=2)
     
     def initialize_system(self):
         try:
@@ -148,14 +173,17 @@ class SimpleGUI:
         
         self.is_running = True
         self.start_button.config(text="Stop Detection")
-        self.cap = cv2.VideoCapture(0)
         
-        # Set camera properties for better performance
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        # Use selected camera source
+        if self.source_var.get() == "ipcam":
+            self.cap = self.setup_droidcam()
+        else:
+            self.cap = cv2.VideoCapture(0)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
         
-        if not self.cap.isOpened():
+        if not self.cap or not self.cap.isOpened():
             messagebox.showerror("Error", "Could not open camera!")
             self.stop_detection()
             return
@@ -174,48 +202,54 @@ class SimpleGUI:
         start_time = time.time()
         last_detection = 0
         detection_interval = 0.3  # Run detection every 0.3 seconds for better responsiveness
-        
         while self.is_running:
             ret, frame = self.cap.read()
             if not ret:
                 break
-            
             frame_count += 1
             current_time = time.time()
-            
-            # Run detection more frequently for better responsiveness
             if current_time - last_detection >= detection_interval:
                 try:
                     result = detect_threat(frame, self.model)
                     if result is None:
                         continue
-                    
                     processed_frame, threat_detected, threat_details = result
                     last_detection = current_time
-                    
-                    # Update status
-                    if threat_detected:
-                        self.threat_status.config(text="Threat: DETECTED!", foreground="red")
-                        # Send email with cooldown
-                        if (hasattr(self, 'email_configured') and self.email_configured and 
-                            current_time - self.last_email_time > self.email_cooldown):
+                    self.detection_buffer.pop(0)
+                    self.detection_buffer.append(threat_detected)
+                    smoothed_threat = sum(self.detection_buffer) >= 2
+                    if smoothed_threat:
+                        self.hold_counter = self.hold_period
+                    elif self.hold_counter > 0:
+                        self.hold_counter -= 1
+                        smoothed_threat = True
+                    self.last_smoothed_threat = smoothed_threat
+                    self.last_threat_status = threat_details.get('status')
+                    def send_email_bg(frame, threat_details):
+                        send_threat_email(frame, threat_details)
+                    if (smoothed_threat and hasattr(self, 'email_configured') and self.email_configured and 
+                        current_time - self.last_email_time > self.email_cooldown):
+                        if not is_email_config_valid():
+                            print("[EMAIL] Email config incomplete. Not sending email.")
+                            self.email_status.config(text="Email: Config Incomplete", foreground="red")
+                            self.show_email_popup("Email configuration is incomplete. Please fill all fields and save.")
+                        else:
+                            print(f"[EMAIL] Attempting to send email with config: {EMAIL_CONFIG}")
                             try:
-                                send_threat_email(processed_frame, threat_details)
+                                threading.Thread(target=send_email_bg, args=(processed_frame.copy(), threat_details), daemon=True).start()
+                                print("[EMAIL] Email send triggered in background thread.")
+                                self.email_status.config(text="Email: Alert Sent (background)", foreground="green")
                                 self.last_email_time = current_time
-                            except:
-                                pass
-                    else:
-                        self.threat_status.config(text="Threat: Normal", foreground="green")
-                    
-                    # Update FPS
+                            except Exception as e:
+                                print(f"[EMAIL] Exception during email send: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                self.email_status.config(text="Email: Alert Exception", foreground="red")
+                                self.show_email_popup(f"Exception during email send: {e}")
                     fps = frame_count / (current_time - start_time)
-                    self.fps_label.config(text=f"FPS: {fps:.1f}")
-                    
-                    # Put frame in queue for display (non-blocking)
                     try:
                         self.frame_queue.put_nowait(processed_frame)
                     except queue.Full:
-                        # Clear queue and put new frame
                         try:
                             self.frame_queue.get_nowait()
                         except:
@@ -224,25 +258,8 @@ class SimpleGUI:
                             self.frame_queue.put_nowait(processed_frame)
                         except:
                             pass
-                            
                 except Exception as e:
                     print(f"Detection error: {e}")
-            else:
-                # For frames without detection, just update FPS and display
-                fps = frame_count / (current_time - start_time)
-                if frame_count % 15 == 0:  # Update FPS every 15 frames
-                    self.fps_label.config(text=f"FPS: {fps:.1f}")
-                
-                # Put original frame in queue for display
-                try:
-                    self.frame_queue.put_nowait(frame)
-                except queue.Full:
-                    try:
-                        self.frame_queue.get_nowait()
-                        self.frame_queue.put_nowait(frame)
-                    except:
-                        pass
-            
             time.sleep(0.01)  # Reduced sleep time for better responsiveness
     
     def update_display(self):
@@ -322,8 +339,11 @@ class SimpleGUI:
                         
                         self.email_status.config(text="Email: Loaded", foreground="blue")
                         self.email_configured = True
+            else:
+                self.email_configured = False
         except:
             self.email_status.config(text="Email: Not configured", foreground="red")
+            self.email_configured = False
     
     def save_email(self):
         self.save_email_config()
@@ -378,6 +398,56 @@ class SimpleGUI:
         except Exception as e:
             self.email_status.config(text="Email: Test Failed", foreground="red")
             messagebox.showerror("Error", f"Connection failed: {e}")
+
+    def toggle_source_entry(self):
+        if self.source_var.get() == "ipcam":
+            self.ipcam_url_entry.configure(state="normal")
+            self.test_ipcam_btn.configure(state="normal")
+        else:
+            self.ipcam_url_entry.configure(state="disabled")
+            self.test_ipcam_btn.configure(state="disabled")
+    
+    def test_droidcam_connection(self):
+        """Test DroidCam connection without starting full detection"""
+        self.ipcam_status.config(text="DroidCam: Testing...", foreground="blue")
+        self.test_ipcam_btn.config(state="disabled")
+        
+        # Run test in background thread
+        def test_connection():
+            try:
+                cap = self.setup_droidcam()
+                if cap and cap.isOpened():
+                    # Test reading a few frames
+                    success_count = 0
+                    for i in range(5):
+                        ret, frame = cap.read()
+                        if ret and frame is not None:
+                            success_count += 1
+                        time.sleep(0.1)
+                    
+                    cap.release()
+                    
+                    if success_count >= 3:
+                        self.ipcam_status.config(text="DroidCam: Connected ✓", foreground="green")
+                        messagebox.showinfo("Success", f"DroidCam connection successful!\nWorking URL: {self.ipcam_url_var.get()}")
+                    else:
+                        self.ipcam_status.config(text="DroidCam: Connection unstable", foreground="orange")
+                        messagebox.showwarning("Warning", "DroidCam connected but frames are unstable.\nTry restarting DroidCam app.")
+                else:
+                    self.ipcam_status.config(text="DroidCam: Connection failed", foreground="red")
+                    
+            except Exception as e:
+                self.ipcam_status.config(text="DroidCam: Test error", foreground="red")
+                messagebox.showerror("Error", f"Connection test failed: {e}")
+            finally:
+                self.test_ipcam_btn.config(state="normal")
+        
+        threading.Thread(target=test_connection, daemon=True).start()
+
+    def show_email_popup(self, message, success=False):
+        """Show a messagebox for email status. Only show for errors."""
+        if not success:
+            messagebox.showerror("Email Alert", message)
 
 def main():
     root = tk.Tk()
