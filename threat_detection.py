@@ -10,6 +10,8 @@ from email.mime.image import MIMEImage
 from datetime import datetime
 from ultralytics import YOLO
 import threading
+import requests
+from urllib.parse import urlparse
 
 # Email configuration - Update these with your email settings
 EMAIL_CONFIG = {
@@ -20,6 +22,154 @@ EMAIL_CONFIG = {
     'recipient_email': 'huzaifaa66asi@gmail.com',  # Replace with recipient email
     'subject_prefix': 'THREAT DETECTED - AI Security System'
 }
+
+# DroidCam configuration
+DROIDCAM_CONFIG = {
+    'default_url': 'http://192.168.1.100:4747/video',
+    'timeout': 5,
+    'retry_attempts': 3,
+    'connection_test_frames': 5
+}
+
+def test_droidcam_connection(url):
+    """Test DroidCam connection and return status."""
+    print(f"🔍 Testing DroidCam connection to: {url}")
+    
+    try:
+        # Ensure URL has proper format
+        if not url.startswith('http://') and not url.startswith('https://'):
+            url = 'http://' + url
+        
+        # Test basic connectivity
+        parsed_url = urlparse(url)
+        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        
+        print(f"Testing server connectivity to: {base_url}")
+        
+        # Test if server is reachable
+        response = requests.get(base_url, timeout=DROIDCAM_CONFIG['timeout'])
+        if response.status_code != 200:
+            print(f"❌ DroidCam server responded with status: {response.status_code}")
+            return False, f"Server error: {response.status_code}"
+        
+        print("✅ Server connectivity test passed")
+        
+        # Test video stream
+        print(f"Testing video stream at: {url}")
+        cap = cv2.VideoCapture(url)
+        if not cap.isOpened():
+            print("❌ Could not open DroidCam video stream")
+            return False, "Could not open video stream"
+        
+        print("✅ Video stream opened successfully")
+        
+        # Test reading frames
+        success_count = 0
+        for i in range(DROIDCAM_CONFIG['connection_test_frames']):
+            ret, frame = cap.read()
+            if ret and frame is not None and frame.size > 0:
+                success_count += 1
+                print(f"Frame {i+1}: Success ({frame.shape})")
+            else:
+                print(f"Frame {i+1}: Failed to read")
+            time.sleep(0.1)
+        
+        cap.release()
+        
+        if success_count >= 3:
+            print(f"✅ DroidCam connection successful! ({success_count}/{DROIDCAM_CONFIG['connection_test_frames']} frames)")
+            return True, f"Connected successfully ({success_count}/{DROIDCAM_CONFIG['connection_test_frames']} frames)"
+        else:
+            print(f"⚠️ DroidCam connected but unstable ({success_count}/{DROIDCAM_CONFIG['connection_test_frames']} frames)")
+            return False, f"Connection unstable ({success_count}/{DROIDCAM_CONFIG['connection_test_frames']} frames)"
+            
+    except requests.exceptions.ConnectionError:
+        print("❌ DroidCam connection failed - server unreachable")
+        return False, "Server unreachable"
+    except requests.exceptions.Timeout:
+        print("❌ DroidCam connection timeout")
+        return False, "Connection timeout"
+    except Exception as e:
+        print(f"❌ DroidCam test error: {str(e)}")
+        return False, f"Test error: {str(e)}"
+
+def setup_droidcam(url=None):
+    """Setup DroidCam connection with retry logic."""
+    if url is None:
+        url = DROIDCAM_CONFIG['default_url']
+    
+    print(f"📱 Setting up DroidCam connection to: {url}")
+    
+    for attempt in range(DROIDCAM_CONFIG['retry_attempts']):
+        try:
+            cap = cv2.VideoCapture(url)
+            
+            if not cap.isOpened():
+                print(f"⚠️ Attempt {attempt + 1}: Could not open DroidCam stream")
+                if attempt < DROIDCAM_CONFIG['retry_attempts'] - 1:
+                    time.sleep(1)
+                    continue
+                else:
+                    print("❌ Failed to connect to DroidCam after all attempts")
+                    return None
+            
+            # Test reading a frame
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                print(f"⚠️ Attempt {attempt + 1}: Could not read frame from DroidCam")
+                cap.release()
+                if attempt < DROIDCAM_CONFIG['retry_attempts'] - 1:
+                    time.sleep(1)
+                    continue
+                else:
+                    print("❌ Failed to read frames from DroidCam after all attempts")
+                    return None
+            
+            print(f"✅ DroidCam connected successfully on attempt {attempt + 1}")
+            return cap
+            
+        except Exception as e:
+            print(f"⚠️ Attempt {attempt + 1}: DroidCam setup error: {str(e)}")
+            if attempt < DROIDCAM_CONFIG['retry_attempts'] - 1:
+                time.sleep(1)
+                continue
+            else:
+                print("❌ Failed to setup DroidCam after all attempts")
+                return None
+    
+    return None
+
+def setup_camera_source(source_type="webcam", droidcam_url=None):
+    """Setup camera source (webcam or DroidCam)."""
+    print(f"📷 Setting up camera source: {source_type}")
+    
+    if source_type.lower() == "droidcam" or source_type.lower() == "ipcam":
+        if droidcam_url is None:
+            droidcam_url = DROIDCAM_CONFIG['default_url']
+        
+        print(f"📱 Attempting DroidCam connection to: {droidcam_url}")
+        cap = setup_droidcam(droidcam_url)
+        
+        if cap is None:
+            print("❌ DroidCam connection failed")
+            return None  # Return None instead of falling back to webcam
+        else:
+            print("✅ DroidCam connection established")
+    else:
+        # Default webcam setup
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("❌ Failed to open webcam")
+            return None
+        print("✅ Webcam connection established")
+    
+    # Set camera properties for better performance
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer size for lower latency
+    
+    return cap
 
 def is_email_config_valid():
     """Check if EMAIL_CONFIG has all required fields and they are non-empty."""
@@ -236,6 +386,70 @@ def setup_arduino(port=None, baud_rate=9600):
     print("Failed to connect to Arduino on any port")
     return None
 
+def test_droidcam_standalone():
+    """Standalone function to test DroidCam connection."""
+    print("🔍 DroidCam Connection Tester")
+    print("=" * 40)
+    
+    print("Enter your DroidCam connection details:")
+    print("(The system will automatically add 'http://' and '/video')")
+    
+    # Get IP address
+    ip_address = input("Enter your phone's IP address (e.g., 192.168.1.100): ").strip()
+    if not ip_address:
+        print("❌ IP address is required!")
+        return
+    
+    # Get port (with default)
+    port_input = input("Enter port number (press Enter for default 4747): ").strip()
+    port = port_input if port_input else "4747"
+    
+    # Build the full URL
+    droidcam_url = f"http://{ip_address}:{port}/video"
+    
+    print(f"\nTesting connection to: {droidcam_url}")
+    print("Make sure:")
+    print("1. DroidCam app is running on your phone")
+    print("2. Your phone and computer are on the same WiFi network")
+    print("3. The IP address matches your phone's IP address")
+    
+    input("\nPress Enter to start testing...")
+    
+    success, message = test_droidcam_connection(droidcam_url)
+    
+    if success:
+        print(f"\n✅ SUCCESS: {message}")
+        print("\nDroidCam is working correctly!")
+        print("You can now use this URL in the main threat detection system.")
+        
+        # Test actual video capture
+        print("\nTesting video capture...")
+        cap = setup_droidcam(droidcam_url)
+        if cap:
+            print("✅ Video capture test successful!")
+            print("Reading a few frames to verify...")
+            
+            for i in range(5):
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    print(f"Frame {i+1}: {frame.shape}")
+                else:
+                    print(f"Frame {i+1}: Failed to read")
+                time.sleep(0.5)
+            
+            cap.release()
+            print("✅ DroidCam is fully functional!")
+        else:
+            print("❌ Video capture test failed")
+    else:
+        print(f"\n❌ FAILED: {message}")
+        print("\nTroubleshooting tips:")
+        print("1. Check if DroidCam app is running on your phone")
+        print("2. Verify your phone's IP address (check DroidCam app)")
+        print("3. Ensure both devices are on the same WiFi network")
+        print("4. Try restarting DroidCam app")
+        print("5. Check if any firewall is blocking the connection")
+
 def main():
     """Main program execution."""
     # Load YOLOv8 model
@@ -250,13 +464,162 @@ def main():
     print("Connecting to Arduino...")
     arduino = setup_arduino()
     
-    # Start webcam
-    print("Starting webcam...")
-    cap = cv2.VideoCapture(0)
+    # Interactive menu for camera selection
+    print("\n📷 Camera Selection Menu:")
+    print("=" * 40)
+    print("1. Use PC Webcam")
+    print("2. Use DroidCam Virtual Camera (Recommended)")
+    print("3. Use DroidCam with IP")
+    print("4. Test DroidCam connection")
+    print("5. Exit")
     
-    if not cap.isOpened():
-        print("Error: Could not open webcam.")
+    cap = None
+    while cap is None:
+        choice = input("\nEnter your choice (1-5): ").strip()
+        
+        if choice == '1':
+            print("Using PC webcam...")
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                print("❌ Failed to open webcam. Please try again.")
+                continue
+            print("✅ Webcam connection established")
+            
+        elif choice == '2':
+            print("Using DroidCam Virtual Camera...")
+            cap = cv2.VideoCapture(1)  # This is the working DroidCam index
+            if not cap.isOpened():
+                print("❌ Failed to open DroidCam Virtual Camera.")
+                print("Make sure DroidCam is installed and running on your PC.")
+                continue
+            
+            # Test reading a frame
+            ret, frame = cap.read()
+            if not ret:
+                print("❌ Could not read frame from DroidCam Virtual Camera.")
+                cap.release()
+                continue
+                
+            print("✅ DroidCam Virtual Camera connection successful!")
+            
+        elif choice == '3':
+            print("\nDroidCam IP Connection Setup:")
+            print("1. Make sure DroidCam is running on your phone")
+            print("2. Check the IP address shown in DroidCam app")
+            print("3. Enter the details below:")
+            
+            ip = input("\nEnter DroidCam IP address (e.g., 192.168.100.2): ").strip()
+            if not ip:
+                print("IP address cannot be empty. Please try again.")
+                continue
+                
+            port = input("Enter DroidCam port (default: 4747): ").strip() or "4747"
+            
+            # First try the virtual camera
+            print("\nTrying virtual camera first...")
+            cap = cv2.VideoCapture(1)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                if ret:
+                    print("✅ Virtual camera connection successful!")
+                    break
+                cap.release()
+            
+            # If virtual camera fails, try IP
+            print("\nTrying IP connection...")
+            source = f"http://{ip}:{port}/video"
+            print(f"Connecting to: {source}")
+            
+            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            if not cap.isOpened():
+                # If HTTP fails, try RTSP
+                rtsp_url = source.replace('http://', 'rtsp://')
+                print(f"Trying RTSP connection: {rtsp_url}")
+                cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+            
+            if not cap.isOpened():
+                print("❌ Failed to connect to DroidCam via IP.")
+                print("Please try option 2 (DroidCam Virtual Camera) instead.")
+                continue
+                
+            print("✅ DroidCam IP connection successful!")
+            
+        elif choice == '4':
+            print("Testing DroidCam connection...")
+            print("Enter your DroidCam connection details:")
+            print("(The system will automatically add 'http://' and '/video')")
+            
+            # Get IP address
+            ip_address = input("Enter your phone's IP address (e.g., 192.168.1.100): ").strip()
+            if not ip_address:
+                print("❌ IP address is required!")
+                continue
+            
+            # Get port (with default)
+            port_input = input("Enter port number (press Enter for default 4747): ").strip()
+            port = port_input if port_input else "4747"
+            
+            # Build the full URL
+            droidcam_url = f"http://{ip_address}:{port}/video"
+            print(f"Testing connection to: {droidcam_url}")
+            
+            success, message = test_droidcam_connection(droidcam_url)
+            if success:
+                print(f"✅ {message}")
+                use_droidcam = input("DroidCam test successful! Use DroidCam? (y/n): ").strip().lower()
+                if use_droidcam == 'y':
+                    # Try virtual camera first
+                    print("Trying virtual camera...")
+                    cap = cv2.VideoCapture(1)
+                    if cap.isOpened():
+                        ret, frame = cap.read()
+                        if ret:
+                            print("✅ Using DroidCam Virtual Camera!")
+                            break
+                        cap.release()
+                    
+                    # Fallback to IP
+                    cap = setup_camera_source("droidcam", droidcam_url)
+                    if cap is None:
+                        print("❌ DroidCam connection failed despite successful test. Please try again.")
+                        continue
+                else:
+                    print("Using webcam instead...")
+                    cap = cv2.VideoCapture(0)
+                    if not cap.isOpened():
+                        print("❌ Failed to open webcam. Please try again.")
+                        continue
+            else:
+                print(f"❌ {message}")
+                print("DroidCam test failed. Please try again or select a different option.")
+                continue
+                
+        elif choice == '5':
+            print("Exiting...")
+            return
+        else:
+            print("Invalid choice. Please try again.")
+            continue
+    
+    if not cap or not cap.isOpened():
+        print("Error: Could not open camera.")
+        print("\nTroubleshooting steps:")
+        print("1. Make sure your webcam is connected and working")
+        print("2. Check if another application is using the webcam")
+        print("3. For DroidCam: Make sure the app is running on your phone")
+        print("4. For DroidCam: Verify your phone and computer are on the same network")
         return
+
+    # Set camera properties for better performance
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer size for lower latency
+    
+    print("\nPress 'q' to quit")
+    print("Press 's' to save current frame")
+    print("Press 'r' to reset counters")
+    print("📧 Email alerts will be sent when threats are detected.")
     
     previous_state = False  # Track the previous threat state
     frame_count = 0
@@ -264,15 +627,42 @@ def main():
     last_email_time = 0  # Track last email sent time
     email_cooldown = 60  # Send email only once every 60 seconds
     
+    # Threat detection statistics
+    threat_count = 0
+    total_threats_detected = 0
+    
     detection_buffer = [False] * 10  # Increased buffer size for more smoothing
     hold_counter = 0  # Hold period counter
     hold_period = 10  # Number of frames to hold alert after last detection
     
-    print("System ready! Press 'q' to exit.")
-    print("📧 Email alerts will be sent when threats are detected.")
-    
     def send_email_background(frame, threat_details):
         threading.Thread(target=send_threat_email, args=(frame.copy(), threat_details), daemon=True).start()
+    
+    def save_current_frame(frame, threat_details):
+        """Save the current frame with threat information."""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"threat_detection_{timestamp}.jpg"
+        
+        # Create a copy of the frame to add save confirmation
+        save_frame = frame.copy()
+        cv2.putText(save_frame, f"SAVED: {timestamp}", (10, save_frame.shape[0] - 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        cv2.imwrite(filename, save_frame)
+        print(f"✅ Frame saved as: {filename}")
+        print(f"   Threat Level: {threat_details.get('threat_level', 'Unknown')}")
+        print(f"   Detected Objects: {', '.join(threat_details.get('detected_objects', []))}")
+    
+    def reset_counters():
+        """Reset all counters and statistics."""
+        nonlocal frame_count, threat_count, total_threats_detected, start_time, last_email_time
+        frame_count = 0
+        threat_count = 0
+        total_threats_detected = 0
+        start_time = time.time()
+        last_email_time = 0
+        print("🔄 All counters reset!")
+    
     while True:
         try:
             ret, frame = cap.read()
@@ -285,12 +675,27 @@ def main():
                 continue
             frame, threat_detected, threat_details = result
             frame_count += 1
+            
+            # Update threat statistics
+            if threat_detected:
+                threat_count += 1
+                if threat_count == 1:  # First detection in sequence
+                    total_threats_detected += 1
+            
+            # Calculate FPS
             if frame_count % 30 == 0:
                 end_time = time.time()
                 fps = 30 / (end_time - start_time)
                 start_time = time.time()
                 cv2.putText(frame, f"FPS: {fps:.1f}", (10, 120),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            # Add statistics to frame
+            cv2.putText(frame, f"Frame: {frame_count}", (10, 150),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(frame, f"Threats: {total_threats_detected}", (10, 170),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
             cv2.imshow("AI Threat Detection System", frame)
             detection_buffer.pop(0)
             detection_buffer.append(threat_detected)
@@ -302,6 +707,11 @@ def main():
             elif hold_counter > 0:
                 hold_counter -= 1
                 smoothed_threat = True
+            
+            # Reset threat count when no threat detected
+            if not threat_detected:
+                threat_count = 0
+            
             if arduino and smoothed_threat != previous_state:
                 try:
                     signal = "1" if smoothed_threat else "0"
@@ -319,8 +729,16 @@ def main():
                     send_email_background(frame, threat_details)
                     last_email_time = current_time
                     print(f"⏰ Next email can be sent in {email_cooldown} seconds")
-            if cv2.waitKey(1) == ord('q'):
+            
+            # Handle keyboard input
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 break
+            elif key == ord('s'):
+                save_current_frame(frame, threat_details)
+            elif key == ord('r'):
+                reset_counters()
+                
         except Exception as e:
             print(f"⚠️ Error in main loop: {e}")
             print("Continuing...")
@@ -336,4 +754,10 @@ def main():
     return True
 
 if __name__ == "__main__":
-    main()
+    import sys
+    
+    # Check if DroidCam test is requested
+    if len(sys.argv) > 1 and sys.argv[1] == "--test-droidcam":
+        test_droidcam_standalone()
+    else:
+        main()
