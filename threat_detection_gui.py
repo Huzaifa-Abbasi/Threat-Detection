@@ -191,7 +191,12 @@ class EnhancedGUI:
     def initialize_system(self):
         try:
             self.model = load_yolo()
+            # Auto-detect Arduino port; can override via env ARDUINO_PORT or arduino_port.txt
             self.arduino = setup_arduino()
+            if self.arduino:
+                self.arduino_status.config(text="Arduino: Connected", foreground="green")
+            else:
+                self.arduino_status.config(text="Arduino: Disconnected", foreground="red")
             if self.arduino:
                 self.arduino_status.config(text="Arduino: Connected", foreground="green")
             else:
@@ -327,6 +332,12 @@ class EnhancedGUI:
         if self.cap:
             self.cap.release()
             self.cap = None
+        # Ensure Arduino is turned off when stopping detection
+        if self.arduino:
+            try:
+                self.arduino.write(b"0")
+            except Exception as e:
+                print(f"Failed to send stop signal to Arduino: {e}")
     
     def capture_loop(self):
         frame_count = 0
@@ -363,6 +374,32 @@ class EnhancedGUI:
                     elif self.hold_counter > 0:
                         self.hold_counter -= 1
                         smoothed_threat = True
+                    # Send signal to Arduino when threat state changes
+                    if self.arduino and smoothed_threat != self.last_smoothed_threat:
+                        try:
+                            signal = "1" if smoothed_threat else "0"
+                            self.arduino.write(signal.encode())
+                            self.arduino.flush()  # Ensure immediate transmission
+                            print(f"✅ Sent signal '{signal}' to Arduino")
+                            time.sleep(0.05)  # Small delay to prevent signal overlap
+                        except Exception as e:
+                            print(f"⚠️ Failed to send signal to Arduino: {e}")
+                            # Try to reconnect Arduino if communication fails
+                            try:
+                                self.arduino.close()
+                                time.sleep(1)
+                                self.arduino = setup_arduino()
+                                if self.arduino:
+                                    try:
+                                        port_text = getattr(self.arduino, "port", "(unknown port)")
+                                        print(f"✅ Arduino reconnected successfully on {port_text}")
+                                        self.arduino_status.config(text=f"Arduino: Connected ({port_text})", foreground="green")
+                                    except Exception:
+                                        print("✅ Arduino reconnected successfully")
+                                        self.arduino_status.config(text="Arduino: Connected", foreground="green")
+                            except Exception as reconnect_error:
+                                print(f"❌ Failed to reconnect Arduino: {reconnect_error}")
+                                self.arduino_status.config(text="Arduino: Reconnection Failed", foreground="red")
                     self.last_smoothed_threat = smoothed_threat
                     self.last_threat_status = threat_details.get('status')
                     

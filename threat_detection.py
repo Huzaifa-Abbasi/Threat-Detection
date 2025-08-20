@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import serial
+from serial.tools import list_ports
 import time
 import os
 import smtplib
@@ -358,32 +359,105 @@ def detect_threat(frame, model):
     }
 
 def setup_arduino(port=None, baud_rate=9600):
-    """Establish serial communication with Arduino."""
-    # Try common serial ports
-    potential_ports = []
-    
-    # Add OS-specific common ports
-    if os.name == 'nt':  # Windows
-        potential_ports = ['COM%s' % (i + 1) for i in range(10)]
-    else:  # Linux/Mac
-        potential_ports = ['/dev/ttyUSB%s' % i for i in range(10)]
-        potential_ports += ['/dev/ttyACM%s' % i for i in range(10)]
-    
-    # If port is specified, try it first
+    """Establish serial communication with Arduino and verify readiness.
+
+    Tries the provided `port` first, then common ports for the OS. After opening,
+    waits for the Arduino reset, flushes buffers, attempts to read the ready banner,
+    and sends an initial "0" to ensure the alert is off.
+    """
+    # Build prioritized list of candidate ports
+    candidates = []
+
+    # 1) Explicit overrides: arg, env var, config file
     if port:
-        potential_ports.insert(0, port)
-    
-    # Try ports until one works
-    for port in potential_ports:
+        candidates.append(port)
+    env_port = os.environ.get("ARDUINO_PORT")
+    if env_port:
+        candidates.append(env_port)
+    try:
+        cfg_path = os.path.join(os.getcwd(), "arduino_port.txt")
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r") as f:
+                file_port = f.read().strip()
+                if file_port:
+                    candidates.append(file_port)
+    except Exception:
+        pass
+
+    # 2) Enumerate system serial ports and prefer Arduino-like devices
+    detected_ports = list(list_ports.comports())
+    def is_arduino_like(p):
+        desc = (p.description or "").lower()
+        hwid = (p.hwid or "").lower()
+        vid = getattr(p, "vid", None)
+        pid = getattr(p, "pid", None)
+        arduino_keywords = ["arduino", "genuino", "ch340", "wch", "cp210", "usb-serial", "usb serial"]
+        if any(k in desc for k in arduino_keywords) or any(k in hwid for k in arduino_keywords):
+            return True
+        # Common Arduino VID/PID vendors (optional heuristic)
+        if vid in (0x2341, 0x1A86, 0x10C4) or pid in (0x0043, 0x7523, 0xEA60):
+            return True
+        return False
+
+    arduino_like_ports = [p.device for p in detected_ports if is_arduino_like(p)]
+    other_detected_ports = [p.device for p in detected_ports if p.device not in arduino_like_ports]
+
+    candidates.extend(arduino_like_ports)
+    candidates.extend(other_detected_ports)
+
+    # 3) Fallback brute-force range
+    if os.name == 'nt':
+        candidates.extend([f"COM{i+1}" for i in range(20)])
+    else:
+        candidates.extend([f"/dev/ttyUSB{i}" for i in range(10)])
+        candidates.extend([f"/dev/ttyACM{i}" for i in range(10)])
+
+    # De-duplicate while preserving order
+    seen = set()
+    potential_ports = []
+    for c in candidates:
+        if c and c not in seen:
+            potential_ports.append(c)
+            seen.add(c)
+
+    # Log detected ports with hints
+    print("[DEBUG] Detected serial ports:")
+    for p in detected_ports:
+        print(f"  - {p.device}: {p.description}")
+    print(f"[DEBUG] Port connection order: {potential_ports}")
+
+    for candidate in potential_ports:
         try:
-            arduino = serial.Serial(port=port, baudrate=baud_rate, timeout=1)
-            time.sleep(2)  # Allow time for connection to establish
-            print(f"Connected to Arduino on {port}")
+            arduino = serial.Serial(port=candidate, baudrate=baud_rate, timeout=1)
+            # Give Arduino time to reset after opening serial
+            time.sleep(3)  # Increased delay for Arduino reset
+            # Clear buffers
+            try:
+                arduino.reset_input_buffer()
+                arduino.reset_output_buffer()
+            except Exception:
+                pass
+            # Try to read any greeting line without blocking too long
+            try:
+                line = arduino.readline().decode(errors="ignore").strip()
+                if line:
+                    print(f"[DEBUG] Arduino banner on {candidate}: {line}")
+            except Exception:
+                pass
+            # Send initial off signal to ensure quiet state
+            try:
+                arduino.write(b"0")
+                arduino.flush()  # Ensure data is sent immediately
+                time.sleep(0.1)  # Small delay to let Arduino process
+            except Exception:
+                pass
+            print(f"✅ Connected to Arduino on {candidate}")
             return arduino
-        except (serial.SerialException, OSError):
+        except (serial.SerialException, OSError) as e:
+            print(f"[DEBUG] Port {candidate} failed: {e}")
             continue
-    
-    print("Failed to connect to Arduino on any port")
+
+    print("❌ Failed to connect to Arduino on any port")
     return None
 
 def test_droidcam_standalone():
@@ -462,6 +536,7 @@ def main():
     
     # Setup Arduino
     print("Connecting to Arduino...")
+    # Auto-detect Arduino port; can override via env ARDUINO_PORT or arduino_port.txt
     arduino = setup_arduino()
     
     # Interactive menu for camera selection
@@ -716,10 +791,24 @@ def main():
                 try:
                     signal = "1" if smoothed_threat else "0"
                     arduino.write(signal.encode())
-                    print(f"Sent signal {signal} to Arduino")
+                    arduino.flush()  # Ensure immediate transmission
+                    print(f"✅ Sent signal '{signal}' to Arduino")
                     previous_state = smoothed_threat
+                    time.sleep(0.05)  # Small delay to prevent signal overlap
                 except Exception as e:
                     print(f"⚠️ Failed to send signal to Arduino: {e}")
+                    # Try to reconnect Arduino if communication fails
+                    try:
+                        arduino.close()
+                        time.sleep(1)
+                        arduino = setup_arduino()
+                        if arduino:
+                            try:
+                                print(f"✅ Arduino reconnected successfully on {arduino.port}")
+                            except Exception:
+                                print("✅ Arduino reconnected successfully")
+                    except Exception as reconnect_error:
+                        print(f"❌ Failed to reconnect Arduino: {reconnect_error}")
             current_time = time.time()
             if smoothed_threat and (current_time - last_email_time) > email_cooldown:
                 if not is_email_config_valid():
